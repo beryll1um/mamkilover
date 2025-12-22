@@ -1,0 +1,3 @@
+# Prevent this file from being displayed by default, as it's generated.
+/Cargo.lock linguist-generated=true
+
