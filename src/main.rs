@@ -5,6 +5,7 @@
 mod formatter;
 
 use regex::Regex;
+use url::Url;
 
 use std::{
     env,
@@ -16,6 +17,7 @@ use std::{
 use teloxide::{
     prelude::*,
     types::{
+        Recipient,
         ParseMode,
         MessageEntity,
         MessageEntityKind,
@@ -23,6 +25,8 @@ use teloxide::{
         PublicChatKind,
         ReplyParameters,
         LinkPreviewOptions,
+        InlineKeyboardMarkup,
+        InlineKeyboardButton,
     },
     RequestError,
     utils::render::Renderer,
@@ -259,6 +263,7 @@ async fn main() {
             let effective_msg = match formatted_msg.as_ref() {
                 None => &msg, Some(formatted) => formatted,
             };
+
             // Only replies can trigger notifications.
             let Some(replied_msg) = msg.reply_to_message() else {
                 return Ok(());
@@ -295,22 +300,26 @@ async fn main() {
                     msg.id, msg.chat.id);
                 return Ok(());
             };
+
             // Messages without public links cannot be notified.
-            let Some(msg_link) = message_link(&effective_msg) else {
+            let Some(Ok(msg_link)) = message_link(&effective_msg)
+                    .map(|link| Url::parse(&link)) else {
                 return Ok(());
             };
             // Render the effective message using HTML to simplify things.
             let effective_html = Renderer::new(
                 effective_msg.text().unwrap_or_default(),
-                msg.entities().unwrap_or_default(),
+                effective_msg.entities().unwrap_or_default(),
             )
             .as_html();
             // Notify the original author about the reply.
             bot.send_message(
                 UserId(user_id as u64),
                 format!(
-                    "{}\n<blockquote>{}</blockquote>\n<i><a href=\"{}\">(View Message)</a></i>",
-                    mention, effective_html, msg_link)
+                    "<blockquote>{}</blockquote>\n— {}",
+                    effective_html,
+                    mention
+                )
             )
             .parse_mode(ParseMode::Html)
             .link_preview_options(LinkPreviewOptions {
@@ -320,6 +329,17 @@ async fn main() {
                 prefer_large_media: false,
                 show_above_text: false,
             })
+            .reply_parameters(ReplyParameters{
+                message_id: replied_msg.id,
+                chat_id: Some(Recipient::Id(replied_msg.chat.id)),
+                ..ReplyParameters::default()
+            })
+            .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::url(
+                    "View in chat",
+                    msg_link,
+                ),
+            ]]))
             .await?;
             Ok(())
         }
