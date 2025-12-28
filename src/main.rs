@@ -38,10 +38,7 @@ use diesel::{
         Pool,
         ConnectionManager,
     },
-    sqlite::{
-        Sqlite,
-        SqliteConnection,
-    }
+    sqlite::SqliteConnection,
 };
 
 /*
@@ -117,12 +114,9 @@ fn message_link(msg: &Message) -> Option<String> {
 /// Applies URL normalization and replacement rules to a message.
 /// If formatting is performed, the original message is replaced and recorded.
 /// Returns the newly sent message when formatting occurs, otherwise `None`.
-async fn maybe_format_message<C>(
-    bot: &Bot, msg: &Message, sqlite_conn: &mut C
-) -> Result<Option<Message>, RequestError>
-where
-    C: Connection<Backend = Sqlite>,
-{
+async fn maybe_format_message(
+    bot: &Bot, msg: &Message, quote: bool
+) -> Result<Option<Message>, RequestError> {
     // Ensure the message has both entities and text; otherwise there is nothing to process.
     let mut entities = match msg.entities() {
         Some(entities) => entities.to_vec(),
@@ -181,22 +175,28 @@ where
     } {
         return Ok(None);
     }
-    // Wrap the entire message in a blockquote for visual distinction.
-    entities.push(
-        MessageEntity::new(MessageEntityKind::Blockquote, 0, text.len())
-    );
+
+    if quote {
+        // Wrap the entire message in a blockquote for visual distinction.
+        entities.push(
+            MessageEntity::new(MessageEntityKind::Blockquote, 0, text.len())
+        );
+    }
     // Convert UTF-16 buffer back to UTF-8 as required by Telegram.
     let mut text = String::from_utf16_lossy(&text);
-    // Append the original author's mention as a footer.
-    let Some(mention) = sender_mention(msg) else {
-        log::error!("Failed to obtain sender mention: MessageId={}|ChatId={}",
-            msg.id, msg.chat.id);
-        return Ok(None);
-    };
-    if let Err(_) = write!(&mut text, "\n— {}", mention) {
-        log::error!("Failed to write sender mention to replacement message footer.");
-        return Ok(None);
+    if quote {
+        // Append the original author's mention as a footer.
+        let Some(mention) = sender_mention(msg) else {
+            log::error!("Failed to obtain sender mention: MessageId={}|ChatId={}",
+                msg.id, msg.chat.id);
+            return Ok(None);
+        };
+        if let Err(_) = write!(&mut text, "\n— {}", mention) {
+            log::error!("Failed to write sender mention to replacement message footer.");
+            return Ok(None);
+        }
     }
+
     // Send the formatted replacement message.
     let mut send_message = bot
         .send_message(msg.chat.id, text)
@@ -215,25 +215,139 @@ where
             ..ReplyParameters::default()
         });
     }
-    let formatted_msg = send_message.await?;
-    // Store the formatted message to support reply-based notifications later.
-    if let Err(err) = diesel::insert_into(formatted_messages::table)
-        .values(NewFormattedMessage {
-            message_id: formatted_msg.id.0,
-            user_tgid: msg.from.as_ref().map_or_else(|| {
-                    log::warn!("Invalid empty UserId assigned to MessageId={}|ChatId={}",
-                        formatted_msg.id.0, formatted_msg.chat.id.0);
-                    0
-                }, |user| user.id.0 as i64),
-            chat_tgid: formatted_msg.chat.id.0,
-        })
-        .execute(sqlite_conn)
-    {
-        log::error!("Failed to insert formatted message: {}", err);
-    }
     // Remove the original unformatted message.
     bot.delete_message(msg.chat.id, msg.id).await?;
-    Ok(Some(formatted_msg))
+    Ok(Some(send_message.await?))
+}
+
+async fn handle_supergroup(
+    bot: Bot, msg: Message, sqlite_pool: Pool<ConnectionManager<SqliteConnection>>,
+) -> ResponseResult<()> {
+    let mut sqlite_conn = match sqlite_pool.get() {
+        Err(err) => {
+            log::error!("Failed to get SQLite connection: {}", err);
+            return Ok(());
+        },
+        Ok(conn) => conn,
+    };
+
+    let maybe_formatted_msg = maybe_format_message(&bot, &msg, true).await?;
+    // If the message was formatted.
+    if let Some(formatted_msg) = maybe_formatted_msg.as_ref() {
+        // Store the formatted message to support reply notifications later.
+        if let Err(err) = diesel::insert_into(formatted_messages::table)
+            .values(NewFormattedMessage {
+                message_id: formatted_msg.id.0,
+                user_tgid: msg.from.as_ref().map_or_else(|| {
+                        log::warn!("Invalid empty UserId assigned to MessageId={}|ChatId={}",
+                            formatted_msg.id.0, formatted_msg.chat.id.0);
+                        0
+                    }, |user| user.id.0 as i64),
+                chat_tgid: formatted_msg.chat.id.0,
+            })
+            .execute(&mut sqlite_conn)
+        {
+            log::error!("Failed to insert formatted message: {}", err);
+        }
+    }
+
+    // Use either the formatted message or, if it hasn't been modified, use the original.
+    let effective_msg = match maybe_formatted_msg.as_ref() {
+        None => &msg, Some(formatted) => formatted,
+    };
+    // Skip further notification processing if the message isn't a reply.
+    let Some(replied_msg) = msg.reply_to_message() else {
+        return Ok(());
+    };
+    // Look up whether the replied message was previously formatted.
+    let maybe_user_id = match formatted_messages::table
+        .filter(formatted_messages::message_id.eq(replied_msg.id.0))
+        .filter(formatted_messages::chat_tgid.eq(replied_msg.chat.id.0))
+        .select(formatted_messages::user_tgid)
+        .first::<i64>(&mut sqlite_conn)
+        .optional()
+    {
+        Err(err) => {
+            log::error!(
+                "Failed to select formatted message: MessageId={}|ChatId={} err={}",
+                replied_msg.id.0,
+                replied_msg.chat.id.0,
+                err
+            );
+            None
+        },
+        Ok(ok) => ok,
+    };
+    // If the message isn't found, it means the reply wasn't sent by a bot.
+    // Telegram notifications will take care of that.
+    let Some(user_id) = maybe_user_id else {
+        return Ok(());
+    };
+    // Avoid notifying authors of their own replies.
+    if user_id == msg.from.as_ref().map_or(0, |user| user.id.0 as i64) {
+        return Ok(());
+    }
+
+    let Some(mention) = sender_mention(&msg) else {
+        log::error!(
+            "Failed to obtain sender mention: MessageId={}|ChatId={}",
+            msg.id,
+            msg.chat.id
+        );
+        return Ok(());
+    };
+    let Some(Ok(msg_link)) = message_link(&effective_msg).map(|link| Url::parse(&link)) else {
+        log::error!(
+            "Failed to obtain message link: MessageId={}|ChatId={}",
+            msg.id,
+            msg.chat.id
+        );
+        return Ok(());
+    };
+
+    // Render the effective message as HTML to simplify things.
+    let effective_html = Renderer::new(
+        effective_msg.text().unwrap_or_default(),
+        effective_msg.entities().unwrap_or_default(),
+    )
+    .as_html();
+    // Notify the original author about the reply.
+    bot.send_message(
+        UserId(user_id as u64),
+        format!(
+            "<blockquote>{}</blockquote>\n— {}",
+            effective_html,
+            mention
+        )
+    )
+    .parse_mode(ParseMode::Html)
+    .link_preview_options(LinkPreviewOptions {
+        is_disabled: true,
+        url: None,
+        prefer_small_media: false,
+        prefer_large_media: false,
+        show_above_text: false,
+    })
+    .reply_parameters(ReplyParameters {
+        message_id: replied_msg.id,
+        chat_id: Some(Recipient::Id(replied_msg.chat.id)),
+        ..ReplyParameters::default()
+    })
+    .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::url(
+            "View in chat",
+            msg_link,
+        ),
+    ]]))
+    .await?;
+    Ok(())
+}
+
+async fn handle_private(
+    bot: Bot, msg: Message, _: Pool<ConnectionManager<SqliteConnection>>,
+) -> ResponseResult<()> {
+    maybe_format_message(&bot, &msg, false).await?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -247,103 +361,24 @@ async fn main() {
             ),
         )
         .unwrap();
-    // Registers the main message handler and starts polling.
-    teloxide::repl(Bot::from_env(), move |bot: Bot, msg: Message| {
-        let sqlite_pool = sqlite_pool.clone();
-        async move {
-            let mut sqlite_conn = match sqlite_pool.get() {
-                Err(err) => {
-                    log::error!("Failed to get SQLite connection: {}", err);
-                    return Ok(());
-                },
-                Ok(conn) => conn,
-            };
-            // Attempt to format the message; fallback to original if not formatted.
-            let formatted_msg = maybe_format_message(&bot, &msg, &mut sqlite_conn).await?;
-            let effective_msg = match formatted_msg.as_ref() {
-                None => &msg, Some(formatted) => formatted,
-            };
-
-            // Only replies can trigger notifications.
-            let Some(replied_msg) = msg.reply_to_message() else {
-                return Ok(());
-            };
-            // Look up whether the replied message was previously formatted.
-            let maybe_user_id = match formatted_messages::table
-                .filter(formatted_messages::message_id.eq(replied_msg.id.0))
-                .filter(formatted_messages::chat_tgid.eq(replied_msg.chat.id.0))
-                .select(formatted_messages::user_tgid)
-                .first::<i64>(&mut sqlite_conn)
-                .optional()
-            {
-                Err(err) => {
-                    log::error!(
-                        "Failed to select formatted message: MessageId={}|ChatId={} err={}",
-                        replied_msg.id.0,
-                        replied_msg.chat.id.0,
-                        err
-                    );
-                    None
-                },
-                Ok(ok) => ok,
-            };
-            // If not found, the replied message was not generated by formatting bot.
-            let Some(user_id) = maybe_user_id else {
-                return Ok(());
-            };
-            // Avoid notifying the author about their own reply.
-            if user_id == msg.from.as_ref().map_or(0, |user| user.id.0 as i64) {
-                return Ok(());
-            }
-            let Some(mention) = sender_mention(&msg) else {
-                log::error!("Failed to obtain sender mention: MessageId={}|ChatId={}",
-                    msg.id, msg.chat.id);
-                return Ok(());
-            };
-
-            // Messages without public links cannot be notified.
-            let Some(Ok(msg_link)) = message_link(&effective_msg)
-                    .map(|link| Url::parse(&link)) else {
-                return Ok(());
-            };
-            // Render the effective message using HTML to simplify things.
-            let effective_html = Renderer::new(
-                effective_msg.text().unwrap_or_default(),
-                effective_msg.entities().unwrap_or_default(),
+    Dispatcher::builder(
+        Bot::from_env(),
+        dptree::entry()
+            .branch(
+                Update::filter_message()
+                    .filter(|msg: Message| msg.chat.is_supergroup())
+                    .endpoint(handle_supergroup),
             )
-            .as_html();
-            // Notify the original author about the reply.
-            bot.send_message(
-                UserId(user_id as u64),
-                format!(
-                    "<blockquote>{}</blockquote>\n— {}",
-                    effective_html,
-                    mention
-                )
-            )
-            .parse_mode(ParseMode::Html)
-            .link_preview_options(LinkPreviewOptions {
-                is_disabled: true,
-                url: None,
-                prefer_small_media: false,
-                prefer_large_media: false,
-                show_above_text: false,
-            })
-            .reply_parameters(ReplyParameters{
-                message_id: replied_msg.id,
-                chat_id: Some(Recipient::Id(replied_msg.chat.id)),
-                ..ReplyParameters::default()
-            })
-            .reply_markup(InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::url(
-                    "View in chat",
-                    msg_link,
-                ),
-            ]]))
-            .await?;
-            Ok(())
-        }
-    })
+            .branch(
+                Update::filter_message()
+                    .filter(|msg: Message| msg.chat.is_private())
+                    .endpoint(handle_private),
+            ),
+    )
+    .dependencies(dptree::deps![sqlite_pool])
+    .enable_ctrlc_handler()
+    .build()
+    .dispatch()
     .await;
 }
 
