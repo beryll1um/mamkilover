@@ -17,6 +17,7 @@ use std::{
 use teloxide::{
     prelude::*,
     types::{
+        MessageId,
         Recipient,
         ParseMode,
         MessageEntity,
@@ -52,15 +53,30 @@ CREATE TABLE IF NOT EXISTS formatted_messages (
     chat_tgid BIG INT,
     PRIMARY KEY (chat_tgid, message_id)
 );
+CREATE TABLE IF NOT EXISTS formatted_replies (
+    message_id INT,
+    user_tgid UNSIGNED BIG INT,
+    source_message_id INT,
+    source_chat_tgid BIG INT,
+    PRIMARY KEY (source_message_id, source_chat_tgid)
+);
 ```
+SQLite maps `UNSIGNED BIG INT` to `INTEGER` internally.
+Diesel represents this as `BigInt` (i64).
 */
 diesel::table! {
     formatted_messages (chat_tgid, message_id) {
         message_id -> Integer,
-        // SQLite maps `UNSIGNED BIG INT` to INTEGER internally.
-        // Diesel represents this as `BigInt` (i64).
         user_tgid -> BigInt,
         chat_tgid -> BigInt,
+    }
+}
+diesel::table! {
+    formatted_replies (source_message_id, source_chat_tgid) {
+        message_id -> Integer,
+        user_tgid -> BigInt,
+        source_message_id -> Integer,
+        source_chat_tgid -> BigInt,
     }
 }
 
@@ -72,19 +88,13 @@ struct NewFormattedMessage {
     chat_tgid: i64,
 }
 
-/// Returns a human-readable mention for the message sender.
-/// Prefers `@username` when available, otherwise falls back to the first name.
-/// Returns `None` if the message has no sender.
-fn sender_mention<'a>(msg: &'a Message) -> Option<Cow<'a, String>> {
-    if let Some(user) = &msg.from {
-        if let Some(username) = &user.username {
-            Some(Cow::Owned(format!("@{}", username)))
-        } else {
-            Some(Cow::Borrowed(&user.first_name))
-        }
-    } else {
-        None
-    }
+#[derive(diesel::Insertable)]
+#[diesel(table_name = formatted_replies)]
+struct NewFormattedReply {
+    message_id: i32,
+    user_tgid: i64,
+    source_message_id: i32,
+    source_chat_tgid: i64,
 }
 
 /// Attempts to construct a public t.me link to a message.
@@ -220,7 +230,40 @@ async fn maybe_format_message(
     Ok(Some(send_message.await?))
 }
 
-async fn handle_supergroup(
+/// Returns a human-readable mention for the message sender.
+/// Prefers `@username` when available, otherwise falls back to the first name.
+/// Returns `None` if the message has no sender.
+fn sender_mention<'a>(msg: &'a Message) -> Option<Cow<'a, String>> {
+    if let Some(user) = &msg.from {
+        if let Some(username) = &user.username {
+            Some(Cow::Owned(format!("@{}", username)))
+        } else {
+            Some(Cow::Borrowed(&user.first_name))
+        }
+    } else {
+        None
+    }
+}
+
+/// Returns a HTML representation of the `msg` with all necessary formatting
+/// to forward it to a user private messages.
+fn build_message_forward(msg: &Message) -> Result<String, ()> {
+    let Some(mention) = sender_mention(msg) else {
+        return Err(());
+    };
+    Ok(
+        format!("<blockquote>{}</blockquote>\n— {}",
+            Renderer::new(
+                msg.text().unwrap_or_default(),
+                msg.entities().unwrap_or_default(),
+            )
+            .as_html(),
+            mention
+        )
+    )
+}
+
+async fn handle_supergroup_message(
     bot: Bot, msg: Message, sqlite_pool: Pool<ConnectionManager<SqliteConnection>>,
 ) -> ResponseResult<()> {
     let mut sqlite_conn = match sqlite_pool.get() {
@@ -230,7 +273,6 @@ async fn handle_supergroup(
         },
         Ok(conn) => conn,
     };
-
     let maybe_formatted_msg = maybe_format_message(&bot, &msg, true).await?;
     // If the message was formatted.
     if let Some(formatted_msg) = maybe_formatted_msg.as_ref() {
@@ -251,10 +293,6 @@ async fn handle_supergroup(
         }
     }
 
-    // Use either the formatted message or, if it hasn't been modified, use the original.
-    let effective_msg = match maybe_formatted_msg.as_ref() {
-        None => &msg, Some(formatted) => formatted,
-    };
     // Skip further notification processing if the message isn't a reply.
     let Some(replied_msg) = msg.reply_to_message() else {
         return Ok(());
@@ -288,13 +326,9 @@ async fn handle_supergroup(
         return Ok(());
     }
 
-    let Some(mention) = sender_mention(&msg) else {
-        log::error!(
-            "Failed to obtain sender mention: MessageId={}|ChatId={}",
-            msg.id,
-            msg.chat.id
-        );
-        return Ok(());
+    // Use either the formatted message or, if it hasn't been modified, use the original.
+    let effective_msg = match maybe_formatted_msg.as_ref() {
+        None => &msg, Some(formatted) => formatted,
     };
     let Some(Ok(msg_link)) = message_link(&effective_msg).map(|link| Url::parse(&link)) else {
         log::error!(
@@ -304,21 +338,18 @@ async fn handle_supergroup(
         );
         return Ok(());
     };
-
-    // Render the effective message as HTML to simplify things.
-    let effective_html = Renderer::new(
-        effective_msg.text().unwrap_or_default(),
-        effective_msg.entities().unwrap_or_default(),
-    )
-    .as_html();
+    let Ok(reply_forward) = build_message_forward(&effective_msg) else {
+        log::error!(
+            "Failed to build reply forward: MessageId={}|ChatId={}",
+            effective_msg.id,
+            effective_msg.chat.id,
+        );
+        return Ok(());
+    };
     // Notify the original author about the reply.
-    bot.send_message(
+    let formatted_reply = bot.send_message(
         UserId(user_id as u64),
-        format!(
-            "<blockquote>{}</blockquote>\n— {}",
-            effective_html,
-            mention
-        )
+        reply_forward,
     )
     .parse_mode(ParseMode::Html)
     .link_preview_options(LinkPreviewOptions {
@@ -340,10 +371,98 @@ async fn handle_supergroup(
         ),
     ]]))
     .await?;
+    // Store the formatted reply to support reply editing later.
+    if let Err(err) = diesel::insert_into(formatted_replies::table)
+        .values(NewFormattedReply {
+            message_id: formatted_reply.id.0,
+            user_tgid: user_id,
+            source_message_id: effective_msg.id.0,
+            source_chat_tgid: effective_msg.chat.id.0,
+        })
+        .execute(&mut sqlite_conn)
+    {
+        log::error!("Failed to insert formatted reply: {}", err);
+    }
     Ok(())
 }
 
-async fn handle_private(
+async fn handle_supergroup_edited_message(
+    bot: Bot, standalone_or_reply: Message, sqlite_pool: Pool<ConnectionManager<SqliteConnection>>,
+) -> ResponseResult<()> {
+    // Look up whether the edited message was reply to the formatted message.
+    let mut sqlite_conn = match sqlite_pool.get() {
+        Err(err) => {
+            log::error!("Failed to get SQLite connection: {}", err);
+            return Ok(());
+        },
+        Ok(conn) => conn,
+    };
+    let maybe_reply = match formatted_replies::table
+        .filter(formatted_replies::source_message_id.eq(standalone_or_reply.id.0))
+        .filter(formatted_replies::source_chat_tgid.eq(standalone_or_reply.chat.id.0))
+        .select((
+            formatted_replies::message_id,
+            formatted_replies::user_tgid,
+        ))
+        .first::<(i32, i64)>(&mut sqlite_conn)
+        .optional()
+    {
+        Err(err) => {
+            log::error!(
+                "Failed to select formatted reply: MessageId={}|ChatId={} err={}",
+                standalone_or_reply.id.0,
+                standalone_or_reply.chat.id.0,
+                err
+            );
+            None
+        },
+        Ok(ok) => ok,
+    };
+    let Some((message_id, user_tgid)) = maybe_reply else {
+        return Ok(());
+    };
+
+    let Ok(reply_forward) = build_message_forward(&standalone_or_reply) else {
+        log::error!(
+            "Failed to build reply forward: MessageId={}|ChatId={}",
+            standalone_or_reply.id,
+            standalone_or_reply.chat.id,
+        );
+        return Ok(());
+    };
+    let Some(Ok(msg_link)) = message_link(&standalone_or_reply)
+            .map(|link| Url::parse(&link)) else {
+        log::error!(
+            "Failed to obtain message link: MessageId={}|ChatId={}",
+            standalone_or_reply.id,
+            standalone_or_reply.chat.id
+        );
+        return Ok(());
+    };
+    bot.edit_message_text(
+        UserId(user_tgid as u64),
+        MessageId(message_id),
+        reply_forward,
+    )
+    .parse_mode(ParseMode::Html)
+    .link_preview_options(LinkPreviewOptions {
+        is_disabled: true,
+        url: None,
+        prefer_small_media: false,
+        prefer_large_media: false,
+        show_above_text: false,
+    })
+    .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::url(
+            "View in chat",
+            msg_link,
+        ),
+    ]]))
+    .await?;
+    Ok(())
+}
+
+async fn handle_private_message(
     bot: Bot, msg: Message, _: Pool<ConnectionManager<SqliteConnection>>,
 ) -> ResponseResult<()> {
     maybe_format_message(&bot, &msg, false).await?;
@@ -367,12 +486,17 @@ async fn main() {
             .branch(
                 Update::filter_message()
                     .filter(|msg: Message| msg.chat.is_supergroup())
-                    .endpoint(handle_supergroup),
+                    .endpoint(handle_supergroup_message),
+            )
+            .branch(
+                Update::filter_edited_message()
+                    .filter(|msg: Message| msg.chat.is_supergroup())
+                    .endpoint(handle_supergroup_edited_message),
             )
             .branch(
                 Update::filter_message()
                     .filter(|msg: Message| msg.chat.is_private())
-                    .endpoint(handle_private),
+                    .endpoint(handle_private_message),
             ),
     )
     .dependencies(dptree::deps![sqlite_pool])
