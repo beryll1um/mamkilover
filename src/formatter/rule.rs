@@ -21,6 +21,16 @@ pub trait Rule {
     fn apply(&self, text: &mut Vec<u16>, entities: &mut Vec<MessageEntity>) -> Effect;
 }
 
+/// Converts a possibly relative or incomplete URL into an absolute URL,
+/// making reasonable assumptions about the protocol if needed.
+fn parse_with_default_scheme(s: &str) -> Result<Url, url::ParseError> {
+    if s.contains("://") {
+        Url::parse(s)
+    } else {
+        Url::parse(&format!("https://{s}"))
+    }
+}
+
 /// Iterates over all URL-related entities and applies a mutation function.
 ///
 /// This function is responsible for:
@@ -45,8 +55,9 @@ where
                 // Extract the UTF-16 range currently representing this URL.
                 let range = entity.offset .. entity.offset + entity.length;
                 let utf8 = &String::from_utf16_lossy(&text[range.clone()]);
-                // Telegram should never emit URL entities that cannot be parsed.
-                let Ok(mut url) = Url::parse(utf8) else {
+                // Telegram should never send URLs that are not parsable, but there is one
+                // special case with URLs that are missing a protocol (scheme).
+                let Ok(mut url) = parse_with_default_scheme(utf8) else {
                     log::error!("Unable to parse the URL from a message: {}", utf8);
                     continue
                 };
