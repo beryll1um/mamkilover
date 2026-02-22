@@ -1,0 +1,9 @@
+edition = "2024"
+fn_params_layout = "Vertical"
+hard_tabs = true
+imports_layout = "Vertical"
+max_width = 80
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+trailing_comma = "Vertical"
+
